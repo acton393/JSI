@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -30,6 +30,10 @@ std::string kindToString(const Value& v, Runtime* rt = nullptr) {
     return "a number";
   } else if (v.isString()) {
     return "a string";
+  } else if (v.isSymbol()) {
+    return "a symbol";
+  } else if (v.isBigInt()) {
+    return "a bigint";
   } else {
     assert(v.isObject() && "Expecting object.");
     return rt != nullptr && v.getObject(*rt).isFunction(*rt) ? "a function"
@@ -60,15 +64,9 @@ Value callGlobalFunction(Runtime& runtime, const char* name, const Value& arg) {
 
 } // namespace
 
-namespace detail {
-
-void throwJSError(Runtime& rt, const char* msg) {
-  throw JSError(rt, msg);
-}
-
-} // namespace detail
-
 Buffer::~Buffer() = default;
+
+MutableBuffer::~MutableBuffer() = default;
 
 PreparedJavaScript::~PreparedJavaScript() = default;
 
@@ -85,6 +83,8 @@ void HostObject::set(Runtime& rt, const PropNameID& name, const Value&) {
 
 HostObject::~HostObject() {}
 
+NativeState::~NativeState() {}
+
 Runtime::~Runtime() {}
 
 Instrumentation& Runtime::instrumentation() {
@@ -97,17 +97,29 @@ Instrumentation& Runtime::instrumentation() {
       return std::unordered_map<std::string, int64_t>{};
     }
 
-    void collectGarbage() override {}
+    void collectGarbage(std::string) override {}
 
-    bool createSnapshotToFile(const std::string&) override {
-      return false;
+    void startTrackingHeapObjectStackTraces(
+        std::function<void(
+            uint64_t,
+            std::chrono::microseconds,
+            std::vector<HeapStatsUpdate>)>) override {}
+    void stopTrackingHeapObjectStackTraces() override {}
+
+    void startHeapSampling(size_t) override {}
+    void stopHeapSampling(std::ostream&) override {}
+
+    void createSnapshotToFile(const std::string&) override {
+      throw JSINativeException(
+          "Default instrumentation cannot create a heap snapshot");
     }
 
-    bool createSnapshotToStream(std::ostream&) override {
-      return false;
+    void createSnapshotToStream(std::ostream&) override {
+      throw JSINativeException(
+          "Default instrumentation cannot create a heap snapshot");
     }
 
-    void writeBridgeTrafficTraceToFile(const std::string&) const override {
+    std::string flushAndDisableBridgeTrafficTrace() override {
       std::abort();
     }
 
@@ -228,6 +240,8 @@ Value::Value(Runtime& runtime, const Value& other) : Value(other.kind_) {
     data_.number = other.data_.number;
   } else if (kind_ == SymbolKind) {
     new (&data_.pointer) Pointer(runtime.cloneSymbol(other.data_.pointer.ptr_));
+  } else if (kind_ == BigIntKind) {
+    new (&data_.pointer) Pointer(runtime.cloneBigInt(other.data_.pointer.ptr_));
   } else if (kind_ == StringKind) {
     new (&data_.pointer) Pointer(runtime.cloneString(other.data_.pointer.ptr_));
   } else if (kind_ >= ObjectKind) {
@@ -257,6 +271,10 @@ bool Value::strictEquals(Runtime& runtime, const Value& a, const Value& b) {
       return runtime.strictEquals(
           static_cast<const Symbol&>(a.data_.pointer),
           static_cast<const Symbol&>(b.data_.pointer));
+    case BigIntKind:
+      return runtime.strictEquals(
+          static_cast<const BigInt&>(a.data_.pointer),
+          static_cast<const BigInt&>(b.data_.pointer));
     case StringKind:
       return runtime.strictEquals(
           static_cast<const String&>(a.data_.pointer),
@@ -267,6 +285,15 @@ bool Value::strictEquals(Runtime& runtime, const Value& a, const Value& b) {
           static_cast<const Object&>(b.data_.pointer));
   }
   return false;
+}
+
+bool Value::asBool() const {
+  if (!isBool()) {
+    throw JSINativeException(
+        "Value is " + kindToString(*this) + ", expected a boolean");
+  }
+
+  return getBool();
 }
 
 double Value::asNumber() const {
@@ -315,6 +342,24 @@ Symbol Value::asSymbol(Runtime& rt) && {
   return std::move(*this).getSymbol(rt);
 }
 
+BigInt Value::asBigInt(Runtime& rt) const& {
+  if (!isBigInt()) {
+    throw JSError(
+        rt, "Value is " + kindToString(*this, &rt) + ", expected a BigInt");
+  }
+
+  return getBigInt(rt);
+}
+
+BigInt Value::asBigInt(Runtime& rt) && {
+  if (!isBigInt()) {
+    throw JSError(
+        rt, "Value is " + kindToString(*this, &rt) + ", expected a BigInt");
+  }
+
+  return std::move(*this).getBigInt(rt);
+}
+
 String Value::asString(Runtime& rt) const& {
   if (!isString()) {
     throw JSError(
@@ -336,6 +381,20 @@ String Value::asString(Runtime& rt) && {
 String Value::toString(Runtime& runtime) const {
   Function toString = runtime.global().getPropertyAsFunction(runtime, "String");
   return toString.call(runtime, *this).getString(runtime);
+}
+
+uint64_t BigInt::asUint64(Runtime& runtime) const {
+  if (!isUint64(runtime)) {
+    throw JSError(runtime, "Lossy truncation in BigInt64::asUint64");
+  }
+  return getUint64(runtime);
+}
+
+int64_t BigInt::asInt64(Runtime& runtime) const {
+  if (!isInt64(runtime)) {
+    throw JSError(runtime, "Lossy truncation in BigInt64::asInt64");
+  }
+  return getInt64(runtime);
 }
 
 Array Array::createWithElements(
@@ -368,11 +427,9 @@ JSError::JSError(Runtime& rt, std::string msg) : message_(std::move(msg)) {
     setValue(
         rt,
         callGlobalFunction(rt, "Error", String::createFromUtf8(rt, message_)));
-  } catch (const std::exception& ex) {
+  } catch (const JSIException& ex) {
     message_ = std::string(ex.what()) + " (while raising " + message_ + ")";
     setValue(rt, String::createFromUtf8(rt, message_));
-  } catch (...) {
-    setValue(rt, Value());
   }
 }
 
@@ -383,10 +440,8 @@ JSError::JSError(Runtime& rt, std::string msg, std::string stack)
     e.setProperty(rt, "message", String::createFromUtf8(rt, message_));
     e.setProperty(rt, "stack", String::createFromUtf8(rt, stack_));
     setValue(rt, std::move(e));
-  } catch (const std::exception& ex) {
+  } catch (const JSIException& ex) {
     setValue(rt, String::createFromUtf8(rt, ex.what()));
-  } catch (...) {
-    setValue(rt, Value());
   }
 }
 
@@ -396,54 +451,78 @@ JSError::JSError(std::string what, Runtime& rt, Value&& value)
 }
 
 void JSError::setValue(Runtime& rt, Value&& value) {
-  value_ = std::make_shared<jsi::Value>(std::move(value));
+  value_ = std::make_shared<Value>(std::move(value));
 
-  try {
-    if ((message_.empty() || stack_.empty()) && value_->isObject()) {
-      auto obj = value_->getObject(rt);
-
-      if (message_.empty()) {
-        jsi::Value message = obj.getProperty(rt, "message");
-        if (!message.isUndefined()) {
-          message_ =
-              callGlobalFunction(rt, "String", message).getString(rt).utf8(rt);
-        }
-      }
-
-      if (stack_.empty()) {
-        jsi::Value stack = obj.getProperty(rt, "stack");
-        if (!stack.isUndefined()) {
-          stack_ =
-              callGlobalFunction(rt, "String", stack).getString(rt).utf8(rt);
-        }
-      }
-    }
+  if ((message_.empty() || stack_.empty()) && value_->isObject()) {
+    auto obj = value_->getObject(rt);
 
     if (message_.empty()) {
-      message_ =
-          callGlobalFunction(rt, "String", *value_).getString(rt).utf8(rt);
+      try {
+        Value message = obj.getProperty(rt, "message");
+        if (!message.isUndefined() && !message.isString()) {
+          message = callGlobalFunction(rt, "String", message);
+        }
+        if (message.isString()) {
+          message_ = message.getString(rt).utf8(rt);
+        } else if (!message.isUndefined()) {
+          message_ = "String(e.message) is a " + kindToString(message, &rt);
+        }
+      } catch (const JSIException& ex) {
+        message_ = std::string("[Exception while creating message string: ") +
+            ex.what() + "]";
+      }
     }
 
     if (stack_.empty()) {
-      stack_ = "no stack";
+      try {
+        Value stack = obj.getProperty(rt, "stack");
+        if (!stack.isUndefined() && !stack.isString()) {
+          stack = callGlobalFunction(rt, "String", stack);
+        }
+        if (stack.isString()) {
+          stack_ = stack.getString(rt).utf8(rt);
+        } else if (!stack.isUndefined()) {
+          stack_ = "String(e.stack) is a " + kindToString(stack, &rt);
+        }
+      } catch (const JSIException& ex) {
+        message_ = std::string("[Exception while creating stack string: ") +
+            ex.what() + "]";
+      }
     }
+  }
 
-    if (what_.empty()) {
-      what_ = message_ + "\n\n" + stack_;
+  if (message_.empty()) {
+    try {
+      if (value_->isString()) {
+        message_ = value_->getString(rt).utf8(rt);
+      } else {
+        Value message = callGlobalFunction(rt, "String", *value_);
+        if (message.isString()) {
+          message_ = message.getString(rt).utf8(rt);
+        } else {
+          message_ = "String(e) is a " + kindToString(message, &rt);
+        }
+      }
+    } catch (const JSIException& ex) {
+      message_ = std::string("[Exception while creating message string: ") +
+          ex.what() + "]";
     }
-  } catch (const std::exception& ex) {
-    message_ = std::string("[Exception while creating message string: ") +
-        ex.what() + "]";
-    stack_ = std::string("Exception while creating stack string: ") +
-        ex.what() + "]";
-    what_ =
-        std::string("Exception while getting value fields: ") + ex.what() + "]";
-  } catch (...) {
-    message_ = "[Exception caught creating message string]";
-    stack_ = "[Exception caught creating stack string]";
-    what_ = "[Exception caught getting value fields]";
+  }
+
+  if (stack_.empty()) {
+    stack_ = "no stack";
+  }
+
+  if (what_.empty()) {
+    what_ = message_ + "\n\n" + stack_;
   }
 }
+
+JSIException::~JSIException() {}
+
+JSINativeException::~JSINativeException() {}
+
+JSError::~JSError() {}
 
 } // namespace jsi
 } // namespace facebook
