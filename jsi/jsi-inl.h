@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -30,7 +30,7 @@ inline Value toValue(Runtime& runtime, const char* str) {
   return String::createFromAscii(runtime, str);
 }
 inline Value toValue(Runtime& runtime, const std::string& str) {
-  return String::createFromAscii(runtime, str);
+  return String::createFromUtf8(runtime, str);
 }
 template <typename T>
 inline Value toValue(Runtime& runtime, const T& other) {
@@ -56,13 +56,22 @@ inline PropNameID&& toPropNameID(Runtime&, PropNameID&& name) {
   return std::move(name);
 }
 
-void throwJSError(Runtime&, const char* msg);
+/// Helper to throw while still compiling with exceptions turned off.
+template <typename E, typename... Args>
+[[noreturn]] inline void throwOrDie(Args&&... args) {
+  std::rethrow_exception(
+      std::make_exception_ptr(E{std::forward<Args>(args)...}));
+}
 
 } // namespace detail
 
 template <typename T>
 inline T Runtime::make(Runtime::PointerValue* pv) {
   return T(pv);
+}
+
+inline Runtime::PointerValue* Runtime::getPointerValue(jsi::Pointer& pointer) {
+  return pointer.ptr_;
 }
 
 inline const Runtime::PointerValue* Runtime::getPointerValue(
@@ -102,19 +111,21 @@ inline bool Object::hasProperty(Runtime& runtime, const PropNameID& name)
 }
 
 template <typename T>
-void Object::setProperty(Runtime& runtime, const char* name, T&& value) {
+void Object::setProperty(Runtime& runtime, const char* name, T&& value) const {
   setProperty(
       runtime, String::createFromAscii(runtime, name), std::forward<T>(value));
 }
 
 template <typename T>
-void Object::setProperty(Runtime& runtime, const String& name, T&& value) {
+void Object::setProperty(Runtime& runtime, const String& name, T&& value)
+    const {
   setPropertyValue(
       runtime, name, detail::toValue(runtime, std::forward<T>(value)));
 }
 
 template <typename T>
-void Object::setProperty(Runtime& runtime, const PropNameID& name, T&& value) {
+void Object::setProperty(Runtime& runtime, const PropNameID& name, T&& value)
+    const {
   setPropertyValue(
       runtime, name, detail::toValue(runtime, std::forward<T>(value)));
 }
@@ -180,7 +191,8 @@ inline std::shared_ptr<T> Object::getHostObject(Runtime& runtime) const {
 template <typename T>
 inline std::shared_ptr<T> Object::asHostObject(Runtime& runtime) const {
   if (!isHostObject<T>(runtime)) {
-    detail::throwJSError(runtime, "Object is not a HostObject of desired type");
+    detail::throwOrDie<JSINativeException>(
+        "Object is not a HostObject of desired type");
   }
   return std::static_pointer_cast<T>(runtime.getHostObject(*this));
 }
@@ -192,16 +204,39 @@ inline std::shared_ptr<HostObject> Object::getHostObject<HostObject>(
   return runtime.getHostObject(*this);
 }
 
+template <typename T>
+inline bool Object::hasNativeState(Runtime& runtime) const {
+  return runtime.hasNativeState(*this) &&
+      std::dynamic_pointer_cast<T>(runtime.getNativeState(*this));
+}
+
+template <>
+inline bool Object::hasNativeState<NativeState>(Runtime& runtime) const {
+  return runtime.hasNativeState(*this);
+}
+
+template <typename T>
+inline std::shared_ptr<T> Object::getNativeState(Runtime& runtime) const {
+  assert(hasNativeState<T>(runtime));
+  return std::static_pointer_cast<T>(runtime.getNativeState(*this));
+}
+
+inline void Object::setNativeState(
+    Runtime& runtime,
+    std::shared_ptr<NativeState> state) const {
+  runtime.setNativeState(*this, state);
+}
+
 inline Array Object::getPropertyNames(Runtime& runtime) const {
   return runtime.getPropertyNames(*this);
 }
 
-inline Value WeakObject::lock(Runtime& runtime) {
+inline Value WeakObject::lock(Runtime& runtime) const {
   return runtime.lockWeakObject(*this);
 }
 
 template <typename T>
-void Array::setValueAtIndex(Runtime& runtime, size_t i, T&& value) {
+void Array::setValueAtIndex(Runtime& runtime, size_t i, T&& value) const {
   setValueAtIndexImpl(
       runtime, i, detail::toValue(runtime, std::forward<T>(value)));
 }
@@ -306,6 +341,10 @@ inline Value Function::callAsConstructor(Runtime& runtime, Args&&... args)
     const {
   return callAsConstructor(
       runtime, {detail::toValue(runtime, std::forward<Args>(args))...});
+}
+
+String BigInt::toString(Runtime& runtime, int radix) const {
+  return runtime.bigintToString(*this, radix);
 }
 
 } // namespace jsi
